@@ -1,20 +1,14 @@
 package com.example.stopyelling
 
 import android.Manifest
+import android.content.ComponentName
 import android.content.Context
+import android.content.Intent
+import android.content.ServiceConnection
 import android.content.pm.PackageManager
-import android.media.AudioFormat
-import android.media.AudioManager
-import android.media.AudioRecord
-import android.media.MediaRecorder
-import android.media.ToneGenerator
 import android.os.Build
 import android.os.Bundle
-import android.os.VibrationEffect
-import android.os.Vibrator
-import android.os.VibratorManager
-import android.speech.tts.TextToSpeech
-import android.speech.tts.UtteranceProgressListener
+import android.os.IBinder
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -38,90 +32,77 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
 import com.example.stopyelling.ui.theme.StopYellingTheme
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
-import java.util.Locale
-import kotlin.math.abs
 
-class MainActivity : ComponentActivity(), TextToSpeech.OnInitListener {
-    private var tts: TextToSpeech? = null
-    private var isSpeakingState = mutableStateOf(false)
+class MainActivity : ComponentActivity() {
+    private var yellingService by mutableStateOf<YellingMonitorService?>(null)
+
+    private val connection = object : ServiceConnection {
+        override fun onServiceConnected(className: ComponentName, service: IBinder) {
+            val binder = service as YellingMonitorService.LocalBinder
+            yellingService = binder.getService()
+        }
+
+        override fun onServiceDisconnected(arg0: ComponentName) {
+            yellingService = null
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        tts = TextToSpeech(this, this)
-        tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-            override fun onStart(utteranceId: String?) {
-                isSpeakingState.value = true
-            }
-            override fun onDone(utteranceId: String?) {
-                if (utteranceId == "FinalRepeat") {
-                    isSpeakingState.value = false
-                }
-            }
-            @Deprecated("Deprecated in Java")
-            override fun onError(utteranceId: String?) {
-                isSpeakingState.value = false
-            }
-        })
-
+        Intent(this, YellingMonitorService::class.java).also { intent ->
+            bindService(intent, connection, Context.BIND_AUTO_CREATE)
+        }
         enableEdgeToEdge()
         setContent {
             StopYellingTheme {
-                StopYellingApp(
-                    isSpeaking = isSpeakingState.value,
-                    onTriggerAlert = { speakThreeTimes() }
-                )
+                StopYellingApp(yellingService)
             }
         }
     }
 
-    override fun onInit(status: Int) {
-        if (status == TextToSpeech.SUCCESS) {
-            tts?.language = Locale.US
-        }
-    }
-
-    private fun speakThreeTimes() {
-        tts?.speak("Who is yelling?", TextToSpeech.QUEUE_FLUSH, null, "Repeat1")
-        tts?.speak("Who is yelling?", TextToSpeech.QUEUE_ADD, null, "Repeat2")
-        tts?.speak("Who is yelling?", TextToSpeech.QUEUE_ADD, null, "FinalRepeat")
-    }
-
     override fun onDestroy() {
-        tts?.stop()
-        tts?.shutdown()
         super.onDestroy()
+        unbindService(connection)
     }
 }
 
 @Composable
-fun StopYellingApp(isSpeaking: Boolean, onTriggerAlert: () -> Unit) {
+fun StopYellingApp(service: YellingMonitorService?) {
     val context = LocalContext.current
     var isMonitoring by remember { mutableStateOf(false) }
     var currentVolume by remember { mutableIntStateOf(0) }
-    var hasPermission by remember {
-        mutableStateOf(
-            ContextCompat.checkSelfPermission(
-                context,
-                Manifest.permission.RECORD_AUDIO
-            ) == PackageManager.PERMISSION_GRANTED
-        )
-    }
+    var isSpeaking by remember { mutableStateOf(false) }
 
-    val threshold = 18000 // Threshold for yelling detection
-
-    val launcher = rememberLauncherForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { isGranted ->
-        hasPermission = isGranted
-        if (!isGranted) {
-            Toast.makeText(context, "Audio recording permission is required", Toast.LENGTH_SHORT).show()
+    // Synchronize UI state with Service state
+    LaunchedEffect(service) {
+        service?.let { s ->
+            s.onUpdate = {
+                currentVolume = s.currentVolume
+                isSpeaking = s.isSpeaking
+                isMonitoring = s.isMonitoring
+            }
+            // Initial sync when service connects
+            currentVolume = s.currentVolume
+            isSpeaking = s.isSpeaking
+            isMonitoring = s.isMonitoring
         }
     }
 
-    val scope = rememberCoroutineScope()
+    var hasPermission by remember {
+        mutableStateOf(
+            ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED &&
+            (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU || ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED)
+        )
+    }
+
+    val launcher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { permissions ->
+        hasPermission = permissions.values.all { it }
+        if (!hasPermission) {
+            Toast.makeText(context, "Permissions are required for monitoring", Toast.LENGTH_SHORT).show()
+        }
+    }
 
     Scaffold(
         modifier = Modifier.fillMaxSize()
@@ -132,6 +113,7 @@ fun StopYellingApp(isSpeaking: Boolean, onTriggerAlert: () -> Unit) {
                 .padding(innerPadding)
                 .background(Color(0xFFFFF176)) // Yellow background
         ) {
+            val threshold = 18000
             val isLoud = isMonitoring && currentVolume > threshold
             val volumeFactor = (currentVolume.toFloat() / 32768f).coerceIn(0f, 1f)
 
@@ -203,9 +185,21 @@ fun StopYellingApp(isSpeaking: Boolean, onTriggerAlert: () -> Unit) {
                 Button(
                     onClick = {
                         if (hasPermission) {
-                            isMonitoring = !isMonitoring
+                            val intent = Intent(context, YellingMonitorService::class.java)
+                            if (!isMonitoring) {
+                                ContextCompat.startForegroundService(context, intent)
+                                isMonitoring = true
+                            } else {
+                                context.stopService(intent)
+                                isMonitoring = false
+                                currentVolume = 0
+                            }
                         } else {
-                            launcher.launch(Manifest.permission.RECORD_AUDIO)
+                            val permissions = mutableListOf(Manifest.permission.RECORD_AUDIO)
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                                permissions.add(Manifest.permission.POST_NOTIFICATIONS)
+                            }
+                            launcher.launch(permissions.toTypedArray())
                         }
                     },
                     modifier = Modifier.size(120.dp),
@@ -219,70 +213,6 @@ fun StopYellingApp(isSpeaking: Boolean, onTriggerAlert: () -> Unit) {
             }
         }
     }
-
-    LaunchedEffect(isMonitoring, isSpeaking) {
-        if (isMonitoring && hasPermission && !isSpeaking) {
-            scope.launch(Dispatchers.IO) {
-                val bufferSize = AudioRecord.getMinBufferSize(
-                    44100,
-                    AudioFormat.CHANNEL_IN_MONO,
-                    AudioFormat.ENCODING_PCM_16BIT
-                )
-                val internalBufferSize = (bufferSize * 4).coerceAtLeast(8820)
-                val audioRecord = try {
-                    AudioRecord(
-                        MediaRecorder.AudioSource.MIC,
-                        44100,
-                        AudioFormat.CHANNEL_IN_MONO,
-                        AudioFormat.ENCODING_PCM_16BIT,
-                        internalBufferSize
-                    )
-                } catch (e: SecurityException) {
-                    null
-                }
-
-                if (audioRecord?.state == AudioRecord.STATE_INITIALIZED) {
-                    audioRecord.startRecording()
-                    val buffer = ShortArray(bufferSize)
-                    var accumulatedLoudTime = 0L
-                    var quietTime = 0L
-
-                    while (isMonitoring && !isSpeaking) {
-                        val readCount = audioRecord.read(buffer, 0, bufferSize)
-                        if (readCount > 0) {
-                            var max = 0
-                            for (i in 0 until readCount) {
-                                val absVal = abs(buffer[i].toInt())
-                                if (absVal > max) max = absVal
-                            }
-                            currentVolume = max
-
-                            val audioDurationMs = (readCount.toLong() * 1000) / 44100
-                            if (max > threshold) {
-                                accumulatedLoudTime += audioDurationMs
-                                quietTime = 0L
-                                if (accumulatedLoudTime >= 4000) {
-                                    triggerPhysicalAlert(context)
-                                    onTriggerAlert()
-                                    accumulatedLoudTime = 0
-                                }
-                            } else {
-                                quietTime += audioDurationMs
-                                if (quietTime > 3000) {
-                                    accumulatedLoudTime = 0
-                                }
-                            }
-                        }
-                        delay(50)
-                    }
-                    audioRecord.stop()
-                    audioRecord.release()
-                }
-            }
-        } else {
-            currentVolume = 0
-        }
-    }
 }
 
 @Composable
@@ -292,102 +222,57 @@ fun AngryStickFigures(isLoud: Boolean, volumeFactor: Float, modifier: Modifier =
         val height = size.height
         val strokeWidth = 10f
 
-        // Dynamic shaking and coloring
         val shakeAmount = if (isLoud) volumeFactor * 15f else 0f
         val randomX = (Math.random().toFloat() - 0.5f) * shakeAmount
         val randomY = (Math.random().toFloat() - 0.5f) * shakeAmount
         val figureColor = if (isLoud) Color(0xFFD32F2F) else Color.Black
 
-        // Adult (Left) - Leaning in
+        // Adult (Left)
         val adultX = width * 0.28f + randomX
         val adultY = height * 0.65f + randomY
         
-        // Head
         drawCircle(figureColor, 55f, Offset(adultX, adultY - 220f), style = Stroke(strokeWidth))
-        // Eyebrows (Less arched, more focused anger)
+        // Eyebrows
         drawLine(figureColor, Offset(adultX - 35f, adultY - 240f), Offset(adultX - 10f, adultY - 232f), strokeWidth + 2)
         drawLine(figureColor, Offset(adultX + 10f, adultY - 232f), Offset(adultX + 35f, adultY - 240f), strokeWidth + 2)
         // Yelling Mouth
         drawCircle(figureColor, 18f, Offset(adultX, adultY - 185f), style = Stroke(strokeWidth))
-        
-        // Body (Leaning forward)
+        // Body
         drawLine(figureColor, Offset(adultX, adultY - 165f), Offset(adultX + 20f, adultY + 50f), strokeWidth)
-        // Arms (Pointing/Gesturing)
+        // Arms
         drawLine(figureColor, Offset(adultX + 10f, adultY - 110f), Offset(adultX + 90f, adultY - 170f), strokeWidth)
         drawLine(figureColor, Offset(adultX + 10f, adultY - 110f), Offset(adultX - 70f, adultY - 60f), strokeWidth)
         // Legs
         drawLine(figureColor, Offset(adultX + 20f, adultY + 50f), Offset(adultX - 30f, adultY + 180f), strokeWidth)
         drawLine(figureColor, Offset(adultX + 20f, adultY + 50f), Offset(adultX + 70f, adultY + 180f), strokeWidth)
 
-        // Child (Right) - Defensive yelling
+        // Child (Right)
         val childX = width * 0.72f - randomX
         val childY = height * 0.72f - randomY
         
-        // Head
         drawCircle(figureColor, 40f, Offset(childX, childY - 150f), style = Stroke(strokeWidth))
-        // Eyebrows (Slanted but flatter)
+        // Eyebrows
         drawLine(figureColor, Offset(childX - 25f, childY - 168f), Offset(childX - 8f, childY - 162f), strokeWidth)
         drawLine(figureColor, Offset(childX + 8f, childY - 162f), Offset(childX + 25f, childY - 168f), strokeWidth)
         // Yelling Mouth
         drawCircle(figureColor, 12f, Offset(childX, childY - 130f), style = Stroke(strokeWidth))
-        
         // Body
         drawLine(figureColor, Offset(childX, childY - 110f), Offset(childX - 15f, childY + 30f), strokeWidth)
-        // Arms (Hands up)
+        // Arms
         drawLine(figureColor, Offset(childX - 5f, childY - 70f), Offset(childX - 70f, childY - 120f), strokeWidth)
         drawLine(figureColor, Offset(childX - 5f, childY - 70f), Offset(childX + 60f, childY - 100f), strokeWidth)
         // Legs
         drawLine(figureColor, Offset(childX - 15f, childY + 30f), Offset(childX - 50f, childY + 120f), strokeWidth)
         drawLine(figureColor, Offset(childX - 15f, childY + 30f), Offset(childX + 20f, childY + 120f), strokeWidth)
 
-        // Visual Yelling Waves
+        // Yelling Waves
         if (isLoud) {
             val waveAlpha = (volumeFactor * 0.8f).coerceIn(0.2f, 0.8f)
             for (i in 1..3) {
                 val offset = i * 30f * volumeFactor
-                drawArc(
-                    color = figureColor.copy(alpha = waveAlpha / i),
-                    startAngle = -45f,
-                    sweepAngle = 90f,
-                    useCenter = false,
-                    topLeft = Offset(adultX + 60f + offset, adultY - 230f),
-                    size = androidx.compose.ui.geometry.Size(80f, 80f),
-                    style = Stroke(4f)
-                )
-                drawArc(
-                    color = figureColor.copy(alpha = waveAlpha / i),
-                    startAngle = 135f,
-                    sweepAngle = 90f,
-                    useCenter = false,
-                    topLeft = Offset(childX - 140f - offset, childY - 180f),
-                    size = androidx.compose.ui.geometry.Size(60f, 60f),
-                    style = Stroke(3f)
-                )
+                drawArc(figureColor.copy(alpha = waveAlpha / i), -45f, 90f, false, Offset(adultX + 60f + offset, adultY - 230f), size = androidx.compose.ui.geometry.Size(80f, 80f), style = Stroke(4f))
+                drawArc(figureColor.copy(alpha = waveAlpha / i), 135f, 90f, false, Offset(childX - 140f - offset, childY - 180f), size = androidx.compose.ui.geometry.Size(60f, 60f), style = Stroke(3f))
             }
         }
     }
-}
-
-private fun triggerPhysicalAlert(context: Context) {
-    val vibrator = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-        val vibratorManager = context.getSystemService(Context.VIBRATOR_MANAGER_SERVICE) as VibratorManager
-        vibratorManager.defaultVibrator
-    } else {
-        @Suppress("DEPRECATION")
-        context.getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
-    }
-
-    if (vibrator.hasVibrator()) {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            vibrator.vibrate(VibrationEffect.createOneShot(2000, VibrationEffect.DEFAULT_AMPLITUDE))
-        } else {
-            @Suppress("DEPRECATION")
-            vibrator.vibrate(2000)
-        }
-    }
-    
-    try {
-        val toneGen = ToneGenerator(AudioManager.STREAM_ALARM, 100)
-        toneGen.startTone(ToneGenerator.TONE_CDMA_ALERT_CALL_GUARD, 400)
-    } catch (e: Exception) {}
 }
