@@ -212,7 +212,7 @@ class YellingMonitorService : Service(), TextToSpeech.OnInitListener {
         val stopPendingIntent = PendingIntent.getService(this, 0, stopIntent, PendingIntent.FLAG_IMMUTABLE)
 
         return NotificationCompat.Builder(this, CHANNEL_ID)
-            .setContentTitle("Yelling Monitor Active")
+            .setContentTitle("What the Yell?")
             .setContentText("Monitoring for loud noises...")
             .setSmallIcon(R.drawable.ic_launcher_foreground)
             .setContentIntent(pendingIntent)

@@ -131,7 +131,7 @@ fun StopYellingApp(service: YellingMonitorService?) {
                 horizontalAlignment = Alignment.CenterHorizontally
             ) {
                 Text(
-                    text = "Stop Yelling Monitor",
+                    text = "What the Yell?",
                     fontSize = 28.sp,
                     fontWeight = FontWeight.Bold,
                     color = Color.Black,
